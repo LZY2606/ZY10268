@@ -1,0 +1,121 @@
+#!/bin/bash
+
+set -eu -o pipefail
+
+# Pre-flight checks - verify all required tools are available and configured
+# before making any changes to the repository
+
+check_command() {
+    if ! command -v "$1" &>/dev/null; then
+        echo "Error: $1 is not installed or not in PATH"
+        exit 1
+    fi
+}
+
+# Verify gh CLI is authenticated
+if ! gh auth status &>/dev/null; then
+    echo "Error: gh CLI is not authenticated. Run 'gh auth login' first."
+    exit 1
+fi
+
+# Verify we can access this repository via gh
+if ! gh repo view --json name &>/dev/null; then
+    echo "Error: Cannot access repository via gh. Check your authentication and repository access."
+    exit 1
+fi
+
+# Verify git can connect to the remote (catches SSH key issues, etc.)
+if ! git ls-remote origin &>/dev/null; then
+    echo "Error: Cannot connect to git remote. Check your git credentials/SSH keys."
+    exit 1
+fi
+
+check_command dotnet
+
+# Check that we're not on the main branch
+current_branch=$(git branch --show-current)
+if [ "$current_branch" = "main" ]; then
+    echo "Error: Releases should not be done directly on the main branch."
+    echo "Please create a release branch and run this script from there."
+    exit 1
+fi
+
+# Fetch latest changes and check that we're not behind origin/main
+echo "Fetching from origin..."
+git fetch origin
+
+if ! git merge-base --is-ancestor origin/main HEAD; then
+    echo "Error: Current branch is behind origin/main."
+    echo "Please merge or rebase with origin/main before releasing."
+    exit 1
+fi
+
+changelog=$(cat releasenotes.md)
+
+regex='
+## ([0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?) \(([0-9]{4}-[0-9]{2}-[0-9]{2})\)
+
+((.|
+)*)
+'
+
+if [[ ! $changelog =~ $regex ]]; then
+    echo "Could not find version/date in releasenotes.md!"
+    exit 1
+fi
+
+version="${BASH_REMATCH[1]}"
+date="${BASH_REMATCH[3]}"
+notes="$(echo "${BASH_REMATCH[4]}" | sed -n -e '/^## [0-9]\+\.[0-9]\+\.[0-9]\+/,$!p')"
+
+if [[ "$date" != "$(date +"%Y-%m-%d")" ]]; then
+    echo "$date is not today!"
+    exit 1
+fi
+
+tag="v$version"
+
+if [ -n "$(git status --porcelain)" ]; then
+    echo ". is not clean." >&2
+    exit 1
+fi
+
+# Update version in all csproj files
+for csproj in MaxMind.Db/MaxMind.Db.csproj MaxMind.Db.Test/MaxMind.Db.Test.csproj MaxMind.Db.Benchmark/MaxMind.Db.Benchmark.csproj; do
+    sed -i "s|<VersionPrefix>[^<]*</VersionPrefix>|<VersionPrefix>$version</VersionPrefix>|" "$csproj"
+done
+
+major="${version%%.*}"
+sed -i "s|<AssemblyVersion>[^<]*</AssemblyVersion>|<AssemblyVersion>${major}.0.0</AssemblyVersion>|" MaxMind.Db/MaxMind.Db.csproj
+
+# Build and test
+dotnet build -c Release
+dotnet test -c Release
+
+echo $'\nDiff:'
+git diff
+
+echo $'\nRelease notes:'
+echo "$notes"
+
+read -r -e -p "Commit changes and create release? (y/n) " should_continue
+
+if [ "$should_continue" != "y" ]; then
+    echo "Aborting"
+    exit 1
+fi
+
+git commit -m "Prepare for $version" -a
+
+git push
+
+gh release create --target "$(git branch --show-current)" -t "$version" -n "$notes" "$tag"
+
+# Now that the release is tagged, validate future changes against it. The
+# package may not be downloadable from NuGet until several minutes after
+# the release workflow publishes it.
+sed -i "s|<PackageValidationBaselineVersion>[^<]*</PackageValidationBaselineVersion>|<PackageValidationBaselineVersion>$version</PackageValidationBaselineVersion>|" MaxMind.Db/MaxMind.Db.csproj
+
+git commit -m "Set package validation baseline to $version" -a
+
+git push

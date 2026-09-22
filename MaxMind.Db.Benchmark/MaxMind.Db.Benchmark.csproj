@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Benchmark project to validate .NET reader for the MaxMind DB file format</Description>
+    <VersionPrefix>5.2.0</VersionPrefix>
+    <TargetFrameworks Condition=" '$(OS)' == 'Windows_NT' ">net10.0;net9.0;net8.0;net481</TargetFrameworks>
+    <TargetFrameworks Condition=" '$(OS)' != 'Windows_NT' ">net10.0;net9.0;net8.0</TargetFrameworks>
+    <AssemblyName>MaxMind.Db.Benchmark</AssemblyName>
+    <OutputType>Exe</OutputType>
+    <PackageId>MaxMind.Db.Benchmark</PackageId>
+    <PackageProjectUrl>https://github.com/maxmind/MaxMind-DB-Reader-dotnet</PackageProjectUrl>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <GenerateAssemblyTitleAttribute>false</GenerateAssemblyTitleAttribute>
+    <GenerateAssemblyDescriptionAttribute>false</GenerateAssemblyDescriptionAttribute>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+    <GenerateAssemblyCopyrightAttribute>false</GenerateAssemblyCopyrightAttribute>
+    <GenerateAssemblyVersionAttribute>false</GenerateAssemblyVersionAttribute>
+    <GenerateAssemblyFileVersionAttribute>false</GenerateAssemblyFileVersionAttribute>
+    <LangVersion>14.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- In CI, don't fail the build on NuGet audit advisories (NU1901-NU1905).
+         Advisories still appear in build output, and Dependabot handles the
+         actual fix. Local builds keep the strict behavior. -->
+    <WarningsNotAsErrors Condition="'$(CI)' == 'true'">$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904;NU1905</WarningsNotAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MaxMind.Db\MaxMind.Db.csproj" />
+    <ProjectReference Include="..\MaxMind.Db.SourceGenerator\MaxMind.Db.SourceGenerator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+  </ItemGroup>
+
+</Project>

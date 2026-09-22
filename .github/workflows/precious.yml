@@ -1,0 +1,29 @@
+name: precious
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "5 5 * * SUN"
+
+permissions: {}
+
+jobs:
+  precious:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          cache: true
+        env:
+          # Multiple dotnet SDKs share a single dotnet-root. Parallel
+          # installs race on the shared binary, causing verification
+          # failures (exit code 150).
+          MISE_JOBS: "1"
+      - name: Run precious lint
+        run: precious lint --all

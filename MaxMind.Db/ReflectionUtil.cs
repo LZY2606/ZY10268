@@ -1,0 +1,130 @@
+#region
+
+using System;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+
+#endregion
+
+namespace MaxMind.Db
+{
+    internal delegate object ObjectActivator(params object?[] args);
+
+    internal static class ReflectionUtil
+    {
+        // Activator.CreateInstance is extremely slow and ConstructorInfo.Invoke is
+        // somewhat slow. This faster alternative (when cached) is largely based off
+        // of:
+        // https://rogerjohansson.blog/2008/02/28/linq-expressions-creating-objects/
+        internal static ObjectActivator CreateActivator(ConstructorInfo constructor)
+        {
+            if (constructor == null)
+            {
+                throw new ArgumentNullException(nameof(constructor));
+            }
+            var paramInfo = constructor.GetParameters();
+
+            var paramExp = Expression.Parameter(typeof(object[]), "args");
+
+            var argsExp = new Expression[paramInfo.Length];
+            for (var i = 0; i < paramInfo.Length; i++)
+            {
+                var index = Expression.Constant(i);
+                var paramType = paramInfo[i].ParameterType;
+                var accessorExp = Expression.ArrayIndex(paramExp, index);
+                var castExp = Expression.Convert(accessorExp, paramType);
+                argsExp[i] = castExp;
+            }
+
+            var newExp = Expression.New(constructor, argsExp);
+            var lambda = Expression.Lambda(typeof(ObjectActivator), newExp, paramExp);
+            // N.B. The AOT analyzer does not report IL3050 for
+            // LambdaExpression.Compile(), so a warning-free AOT-compatible build is not
+            // evidence that this path survives NativeAOT. Only models without a
+            // source-generated registration reach it, and the NativeAOT integration
+            // test under MaxMind.Db.NativeAot is what pins its actual behavior.
+            return (ObjectActivator)lambda.Compile();
+        }
+
+        // Collection factories take a capacity directly, without a boxed
+        // integer and a temporary argument array on each decode.
+        internal static Func<int, object> CreateCapacityActivator(ConstructorInfo constructor)
+        {
+            if (constructor == null)
+            {
+                throw new ArgumentNullException(nameof(constructor));
+            }
+
+            var capacity = Expression.Parameter(typeof(int), "capacity");
+            NewExpression create;
+            if (constructor.GetParameters().Length == 0)
+            {
+                create = Expression.New(constructor);
+            }
+            else
+            {
+                create = Expression.New(constructor, capacity);
+            }
+            // The Compile limitation described in CreateActivator also applies here.
+            return Expression.Lambda<Func<int, object>>(create, capacity).Compile();
+        }
+
+        /// <summary>
+        ///     Creates a compiled activator that uses <c>MemberInit</c> expressions
+        ///     to set properties on an object created via a parameterless constructor.
+        ///     This works with <c>init</c>-only setters because <c>init</c> is a
+        ///     compiler-only restriction, not enforced by the CLR.
+        /// </summary>
+        internal static ObjectActivator CreateMemberInitActivator(
+            ConstructorInfo parameterlessCtor,
+            PropertyInfo[] properties)
+        {
+            if (parameterlessCtor == null)
+            {
+                throw new ArgumentNullException(nameof(parameterlessCtor));
+            }
+            if (properties == null)
+            {
+                throw new ArgumentNullException(nameof(properties));
+            }
+
+            var paramExp = Expression.Parameter(typeof(object[]), "args");
+
+            var bindings = new MemberBinding[properties.Length];
+            for (var i = 0; i < properties.Length; i++)
+            {
+                var index = Expression.Constant(i);
+                var accessorExp = Expression.ArrayIndex(paramExp, index);
+                var castExp = Expression.Convert(accessorExp, properties[i].PropertyType);
+                bindings[i] = Expression.Bind(properties[i], castExp);
+            }
+
+            var newExp = Expression.MemberInit(Expression.New(parameterlessCtor), bindings);
+            var lambda = Expression.Lambda(typeof(ObjectActivator), newExp, paramExp);
+            // See the note on Compile() in CreateActivator: this path is unanalyzed and
+            // is covered only by the NativeAOT integration test.
+            return (ObjectActivator)lambda.Compile();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void CheckType(Type expected, Type from)
+        {
+            if (expected == from)
+            {
+                return;
+            }
+            if (!expected.IsAssignableFrom(from))
+            {
+                ThrowCannotConvert(expected, from);
+            }
+        }
+
+        // Keep error-message construction out of callers that inline CheckType.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ThrowCannotConvert(Type expected, Type from)
+        {
+            throw new DeserializationException($"Could not convert '{from}' to '{expected}'.");
+        }
+    }
+}

@@ -1,0 +1,57 @@
+#region
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Reflection;
+
+#endregion
+
+namespace MaxMind.Db
+{
+    internal sealed class ListActivatorCreator
+    {
+        private readonly ConcurrentDictionary<Type, Func<int, object>> _listActivators =
+            new();
+
+        internal Func<int, object> GetActivator(Type expectedType)
+            => _listActivators.GetOrAdd(expectedType, ListActivator);
+
+#if NET8_0_OR_GREATER
+        [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage(
+            "AOT",
+            "IL3050",
+            Justification = "Generated collection registrations return before this runtime generic construction path. This path serves only the documented fallback for unregistered collection types, which is unsupported in NativeAOT applications.")]
+        [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage(
+            "Trimming",
+            "IL2070",
+            Justification = "Generated collection registrations return before this reflection path. This path serves only the documented fallback for unregistered collection types, which is unsupported in trimmed applications.")]
+#endif
+        private static Func<int, object> ListActivator(Type expectedType)
+        {
+            var genericArgs = expectedType.GetGenericArguments();
+            var argType = genericArgs.Length switch
+            {
+                0 => typeof(object),
+                1 => genericArgs[0],
+                _ => throw new DeserializationException(
+                         $"Unexpected number of generic arguments for list: {genericArgs.Length}"),
+            };
+            ConstructorInfo? constructor;
+            var interfaceType = typeof(ICollection<>).MakeGenericType(argType);
+            var listType = typeof(List<>).MakeGenericType(argType);
+            if (expectedType.IsAssignableFrom(listType))
+            {
+                constructor = listType.GetConstructor([typeof(int)]);
+            }
+            else
+            {
+                ReflectionUtil.CheckType(interfaceType, expectedType);
+                constructor = expectedType.GetConstructor(Type.EmptyTypes);
+            }
+            if (constructor == null)
+                throw new DeserializationException($"Unable to find default constructor for {expectedType}");
+            return ReflectionUtil.CreateCapacityActivator(constructor);
+        }
+    }
+}

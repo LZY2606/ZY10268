@@ -1,0 +1,617 @@
+﻿#region
+
+using System;
+using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading.Tasks;
+
+#endregion
+
+namespace MaxMind.Db
+{
+    internal sealed class MemoryMapBuffer : IDisposable
+    {
+        private readonly MemoryMappedFile _memoryMappedFile;
+        private readonly MemoryMappedViewAccessor _view;
+#if !NETSTANDARD2_0
+        private IntPtr _ptr;
+#endif
+        private bool _disposed;
+        internal long Length { get; }
+
+        // Creates an unnamed file-backed memory-mapped region. Cross-process
+        // page sharing happens via the OS file cache rather than via a named
+        // section object, so this mode is not subject to the access-denied
+        // failures that can occur when opening an ACL-checked named section
+        // under a different user identity on Windows.
+        internal static MemoryMapBuffer CreateFileBacked(string file)
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                                              FileShare.Delete | FileShare.Read);
+            var length = stream.Length;
+            if (length == 0)
+            {
+                throw new InvalidDatabaseException("The database is empty.");
+            }
+            // leaveOpen: true — the `using var stream` above already disposes
+            // the stream on all paths. The OS keeps the underlying file open
+            // via the mapping's internal reference, so the mmf does not need
+            // to own the stream.
+            var mmf = MemoryMappedFile.CreateFromFile(
+                stream,
+                mapName: null,
+                capacity: length,
+                MemoryMappedFileAccess.Read,
+                HandleInheritability.None,
+                leaveOpen: true);
+            try
+            {
+                var view = mmf.CreateViewAccessor(0, length, MemoryMappedFileAccess.Read);
+                return new MemoryMapBuffer(mmf, view, length);
+            }
+            catch
+            {
+                mmf.Dispose();
+                throw;
+            }
+        }
+
+        // Reads the file into an anonymous memory-mapped region that is
+        // private to this process.
+        internal MemoryMapBuffer(string file)
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                                              FileShare.Delete | FileShare.Read);
+            Length = stream.Length;
+
+            (_memoryMappedFile, _view) = CreateMmapFromStream(stream, Length);
+#if !NETSTANDARD2_0
+            AcquireRawPointer();
+#endif
+        }
+
+        // Reads the stream into an anonymous memory-mapped region that is
+        // private to this process.
+        internal MemoryMapBuffer(Stream stream)
+        {
+            if (stream == null)
+            {
+                throw new ArgumentNullException(nameof(stream), "The database stream must not be null.");
+            }
+
+            if (stream.CanSeek)
+            {
+                Length = stream.Length - stream.Position;
+
+                (_memoryMappedFile, _view) = CreateMmapFromStream(stream, Length);
+#if !NETSTANDARD2_0
+                AcquireRawPointer();
+#endif
+                return;
+            }
+
+            var tempFile = Path.GetTempFileName();
+            try
+            {
+                using (var tempStream = new FileStream(tempFile, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                {
+                    stream.CopyTo(tempStream);
+                    Length = tempStream.Length;
+
+                    tempStream.Position = 0;
+                    (_memoryMappedFile, _view) = CreateMmapFromStream(tempStream, Length);
+#if !NETSTANDARD2_0
+                    AcquireRawPointer();
+#endif
+                }
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(tempFile);
+                }
+                catch
+                {
+                    // Best-effort cleanup. If deletion fails, the temp
+                    // file is orphaned but the mmap may already be valid.
+                    // Letting this exception propagate would turn a
+                    // successful construction into a failure and leak the
+                    // mmap resources.
+                }
+            }
+        }
+
+        private MemoryMapBuffer(MemoryMappedFile memoryMappedFile, MemoryMappedViewAccessor view, long length)
+        {
+            Length = length;
+            _memoryMappedFile = memoryMappedFile;
+            _view = view;
+#if !NETSTANDARD2_0
+            AcquireRawPointer();
+#endif
+        }
+
+        internal static async Task<MemoryMapBuffer> CreateAsync(string file)
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                                              FileShare.Delete | FileShare.Read, 4096, true);
+            return await CreateAsync(stream).ConfigureAwait(false);
+        }
+
+        internal static async Task<MemoryMapBuffer> CreateAsync(Stream stream)
+        {
+            if (stream == null)
+            {
+                throw new ArgumentNullException(nameof(stream), "The database stream must not be null.");
+            }
+
+            if (stream.CanSeek)
+            {
+                var length = stream.Length - stream.Position;
+
+                var (memoryMappedFile, view) = await CreateMmapFromStreamAsync(stream, length).ConfigureAwait(false);
+
+                return new MemoryMapBuffer(memoryMappedFile, view, length);
+            }
+
+            var tempFile = Path.GetTempFileName();
+            try
+            {
+                using (var tempStream = new FileStream(tempFile, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 4096, true))
+                {
+                    await stream.CopyToAsync(tempStream).ConfigureAwait(false);
+                    var length = tempStream.Length;
+
+                    tempStream.Position = 0;
+                    var (memoryMappedFile, view) = await CreateMmapFromStreamAsync(tempStream, length).ConfigureAwait(false);
+
+                    return new MemoryMapBuffer(memoryMappedFile, view, length);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(tempFile);
+                }
+                catch
+                {
+                    // Best-effort cleanup. If deletion fails, the temp
+                    // file is orphaned but the mmap may already be valid.
+                    // Letting this exception propagate would turn a
+                    // successful construction into a failure and leak the
+                    // mmap resources.
+                }
+            }
+        }
+
+        private static (MemoryMappedFile File, MemoryMappedViewAccessor View) CreateMmapFromStream(Stream source, long length)
+        {
+            if (length == 0)
+            {
+                throw new InvalidDatabaseException("The database is empty.");
+            }
+
+            var memoryMappedFile = MemoryMappedFile.CreateNew(null, length);
+            try
+            {
+                using (var viewStream = memoryMappedFile.CreateViewStream(0, length, MemoryMappedFileAccess.Write))
+                {
+                    source.CopyTo(viewStream);
+                }
+                var view = memoryMappedFile.CreateViewAccessor(0, length, MemoryMappedFileAccess.Read);
+                return (memoryMappedFile, view);
+            }
+            catch
+            {
+                memoryMappedFile.Dispose();
+                throw;
+            }
+        }
+
+        private static async Task<(MemoryMappedFile File, MemoryMappedViewAccessor View)> CreateMmapFromStreamAsync(Stream source, long length)
+        {
+            if (length == 0)
+            {
+                throw new InvalidDatabaseException("The database is empty.");
+            }
+
+            var memoryMappedFile = MemoryMappedFile.CreateNew(null, length);
+            try
+            {
+                using (var viewStream = memoryMappedFile.CreateViewStream(0, length, MemoryMappedFileAccess.Write))
+                {
+                    await source.CopyToAsync(viewStream).ConfigureAwait(false);
+                }
+                var view = memoryMappedFile.CreateViewAccessor(0, length, MemoryMappedFileAccess.Read);
+                return (memoryMappedFile, view);
+            }
+            catch
+            {
+                memoryMappedFile.Dispose();
+                throw;
+            }
+        }
+
+#if !NETSTANDARD2_0
+        private unsafe void AcquireRawPointer()
+        {
+            try
+            {
+                byte* ptr = null;
+                _view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+                _ptr = (IntPtr)(ptr + _view.PointerOffset);
+            }
+            catch
+            {
+                _view.Dispose();
+                _memoryMappedFile.Dispose();
+                throw;
+            }
+        }
+
+        // Returns a bounds-checked Span over the requested region of the
+        // memory-mapped buffer. This restores CLR bounds checking that raw
+        // pointer access removed, at negligible cost (~1 cmp per index).
+        // Uses a targeted slice rather than spanning the full buffer so
+        // that databases larger than 2 GiB still work (Span length is int).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private unsafe ReadOnlySpan<byte> GetSpan(long offset, int count)
+        {
+            CheckBounds(offset, count);
+            return new ReadOnlySpan<byte>((byte*)_ptr + offset, count);
+        }
+#endif
+
+        // Check the database length, since the view accessor can include
+        // padding beyond the file. GetSpan shares this check on other targets.
+        // Reject negative offsets before unsigned addition, which could wrap.
+        // For nonnegative offsets and counts, the unsigned sum cannot overflow
+        // and keeps offsets beyond long.MaxValue outside the database.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void CheckBounds(long offset, int count)
+        {
+            if (offset < 0 || (ulong)offset + (ulong)count > (ulong)Length)
+            {
+                throw new InvalidDatabaseException(
+                    "Attempt to read beyond the end of the database.");
+            }
+        }
+
+        internal byte[] Read(long offset, int count)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            if (count == 0)
+            {
+                return Array.Empty<byte>();
+            }
+            CheckBounds(offset, count);
+            var bytes = new byte[count];
+            _view.ReadArray(offset, bytes, 0, count);
+            return bytes;
+#else
+            return GetSpan(offset, count).ToArray();
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal byte ReadOne(long offset)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            CheckBounds(offset, 1);
+            return _view.ReadByte(offset);
+#else
+            // This single-byte check rejects negative offsets and needs no addition.
+            if ((ulong)offset >= (ulong)Length)
+            {
+                throw new InvalidDatabaseException(
+                    "Attempt to read beyond the end of the database.");
+            }
+            unsafe
+            {
+                return *(((byte*)_ptr) + offset);
+            }
+#endif
+        }
+
+        internal string ReadString(long offset, int count)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            if (count == 0)
+            {
+                return string.Empty;
+            }
+            CheckBounds(offset, count);
+            var bytes = new byte[count];
+            _view.ReadArray(offset, bytes, 0, count);
+            return Encoding.UTF8.GetString(bytes);
+#else
+            return Encoding.UTF8.GetString(GetSpan(offset, count));
+#endif
+        }
+
+        /// <summary>
+        ///     Read an int from the buffer.
+        /// </summary>
+        internal int ReadInt(long offset)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            CheckBounds(offset, 4);
+            return _view.ReadByte(offset) << 24 |
+                   _view.ReadByte(offset + 1) << 16 |
+                   _view.ReadByte(offset + 2) << 8 |
+                   _view.ReadByte(offset + 3);
+#else
+            var span = GetSpan(offset, 4);
+            return span[0] << 24 |
+                   span[1] << 16 |
+                   span[2] << 8 |
+                   span[3];
+#endif
+        }
+
+        /// <summary>
+        ///     Read a variable-sized int from the buffer.
+        /// </summary>
+        internal int ReadVarInt(long offset, int count)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            // Zero reads nothing. Four delegates to ReadInt, which checks bounds.
+            if (count == 1 || count == 2 || count == 3)
+            {
+                CheckBounds(offset, count);
+            }
+            return count switch
+            {
+                0 => 0,
+                1 => _view.ReadByte(offset),
+                2 => _view.ReadByte(offset) << 8 |
+                     _view.ReadByte(offset + 1),
+                3 => _view.ReadByte(offset) << 16 |
+                     _view.ReadByte(offset + 1) << 8 |
+                     _view.ReadByte(offset + 2),
+                4 => ReadInt(offset),
+                _ => throw new InvalidDatabaseException($"Unexpected int32 of size {count}"),
+            };
+#else
+            if (count == 0)
+            {
+                return 0;
+            }
+            if (count == 4)
+            {
+                return ReadInt(offset);
+            }
+            var span = GetSpan(offset, count);
+            return count switch
+            {
+                1 => span[0],
+                2 => span[0] << 8 |
+                     span[1],
+                3 => span[0] << 16 |
+                     span[1] << 8 |
+                     span[2],
+                _ => throw new InvalidDatabaseException($"Unexpected int32 of size {count}"),
+            };
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal int HashBytes(long offset, int count)
+        {
+#if NETSTANDARD2_0
+            CheckBounds(offset, count);
+            var code = 17;
+            for (var i = 0; i < count; i++)
+            {
+                code = (31 * code) + _view.ReadByte(offset + i);
+            }
+            return code;
+#else
+            var code = 17;
+            var span = GetSpan(offset, count);
+            for (var i = 0; i < span.Length; i++)
+            {
+                code = (31 * code) + span[i];
+            }
+            return code;
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool EqualsBytes(long offset, MemoryMapBuffer other, long otherOffset, int count)
+        {
+#if NETSTANDARD2_0
+            CheckBounds(offset, count);
+            other.CheckBounds(otherOffset, count);
+            for (var i = 0; i < count; i++)
+            {
+                if (_view.ReadByte(offset + i) != other._view.ReadByte(otherOffset + i))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+#else
+            return GetSpan(offset, count).SequenceEqual(other.GetSpan(otherOffset, count));
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool EqualsBytes(long offset, byte[] other, int otherOffset, int count)
+        {
+#if NETSTANDARD2_0
+            CheckBounds(offset, count);
+            for (var i = 0; i < count; i++)
+            {
+                if (_view.ReadByte(offset + i) != other[otherOffset + i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+#else
+            return GetSpan(offset, count).SequenceEqual(other.AsSpan(otherOffset, count));
+#endif
+        }
+
+        /// <summary>
+        ///     Read a big integer from the buffer.
+        /// </summary>
+        internal BigInteger ReadBigInteger(long offset, int size)
+        {
+            var buffer = Read(offset, size);
+            Array.Reverse(buffer);
+
+            if (buffer.Length > 0 && (buffer[buffer.Length - 1] & 0x80) > 0)
+            {
+                Array.Resize(ref buffer, buffer.Length + 1);
+            }
+            return new BigInteger(buffer);
+        }
+
+        /// <summary>
+        ///     Read a double from the buffer.
+        /// </summary>
+        internal double ReadDouble(long offset)
+        {
+            return BitConverter.Int64BitsToDouble(ReadLong(offset, 8));
+        }
+
+        /// <summary>
+        ///     Read a float from the buffer.
+        /// </summary>
+        internal float ReadFloat(long offset)
+        {
+#if NETSTANDARD2_0
+            var buffer = Read(offset, 4);
+            Array.Reverse(buffer);
+            return BitConverter.ToSingle(buffer, 0);
+#else
+            return BitConverter.Int32BitsToSingle(ReadInt(offset));
+#endif
+        }
+
+        /// <summary>
+        ///     Read a long from the buffer.
+        /// </summary>
+        internal long ReadLong(long offset, int size)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            CheckBounds(offset, size);
+            long val = 0;
+            for (var i = 0; i < size; i++)
+            {
+                val = (val << 8) | _view.ReadByte(offset + i);
+            }
+            return val;
+#else
+            var span = GetSpan(offset, size);
+            long val = 0;
+            for (var i = 0; i < span.Length; i++)
+            {
+                val = (val << 8) | span[i];
+            }
+            return val;
+#endif
+        }
+
+        /// <summary>
+        ///     Read a uint64 from the buffer.
+        /// </summary>
+        internal ulong ReadULong(long offset, int size)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(MemoryMapBuffer));
+            }
+
+#if NETSTANDARD2_0
+            CheckBounds(offset, size);
+            ulong val = 0;
+            for (var i = 0; i < size; i++)
+            {
+                val = (val << 8) | _view.ReadByte(offset + i);
+            }
+            return val;
+#else
+            var span = GetSpan(offset, size);
+            ulong val = 0;
+            for (var i = 0; i < span.Length; i++)
+            {
+                val = (val << 8) | span[i];
+            }
+            return val;
+#endif
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        ///     Release resources back to the system.
+        /// </summary>
+        /// <param name="disposing"></param>
+        private void Dispose(bool disposing)
+        {
+            if (_disposed)
+                return;
+
+            if (disposing)
+            {
+                try
+                {
+#if !NETSTANDARD2_0
+                    _view?.SafeMemoryMappedViewHandle.ReleasePointer();
+#endif
+                }
+                finally
+                {
+                    _view?.Dispose();
+                    _memoryMappedFile.Dispose();
+                }
+            }
+
+            _disposed = true;
+        }
+    }
+}

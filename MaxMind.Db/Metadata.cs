@@ -1,0 +1,97 @@
+﻿#region
+
+using System;
+using System.Collections.Generic;
+
+#endregion
+
+namespace MaxMind.Db
+{
+    /// <summary>
+    ///     Data about the database file itself
+    /// </summary>
+    public sealed class Metadata
+    {
+        /// <summary>
+        ///     Construct a metadata object.
+        /// </summary>
+        /// <param name="binaryFormatMajorVersion">The major version of the MaxMind DB binary format.</param>
+        /// <param name="binaryFormatMinorVersion">The minor version of the MaxMind DB binary format.</param>
+        /// <param name="buildEpoch">The database build timestamp as seconds since the Unix epoch.</param>
+        /// <param name="databaseType">The database type string, e.g. "GeoIP2-City".</param>
+        /// <param name="description">A map from locale codes to the database description in that language.</param>
+        /// <param name="ipVersion">The IP version the database supports (4 or 6).</param>
+        /// <param name="languages">The locale codes for languages the database supports.</param>
+        /// <param name="nodeCount">The number of nodes in the search tree.</param>
+        /// <param name="recordSize">The size in bits of each record in the search tree.</param>
+        [Constructor]
+        [CLSCompliant(false)]
+        public Metadata(
+            [MapKey("binary_format_major_version")] int binaryFormatMajorVersion,
+            [MapKey("binary_format_minor_version")] int binaryFormatMinorVersion,
+            [MapKey("build_epoch")] ulong buildEpoch,
+            [MapKey("database_type")] string databaseType,
+            IDictionary<string, string> description,
+            [MapKey("ip_version")] int ipVersion,
+            IReadOnlyList<string> languages,
+            [MapKey("node_count")] long nodeCount,
+            [MapKey("record_size")] int recordSize
+            )
+        {
+            BinaryFormatMajorVersion = binaryFormatMajorVersion;
+            BinaryFormatMinorVersion = binaryFormatMinorVersion;
+            BuildEpoch = buildEpoch;
+            DatabaseType = databaseType;
+            Description = description;
+            IPVersion = ipVersion;
+            Languages = languages;
+            NodeCount = nodeCount;
+            RecordSize = recordSize;
+        }
+
+        /// <summary>
+        ///     The major version number for the MaxMind DB binary format used by the database.
+        /// </summary>
+        public int BinaryFormatMajorVersion { get; }
+
+        /// <summary>
+        ///     The minor version number for the MaxMind DB binary format used by the database.
+        /// </summary>
+        public int BinaryFormatMinorVersion { get; }
+
+        internal ulong BuildEpoch { get; }
+
+        /// <summary>
+        ///     The date-time of the database build.
+        /// </summary>
+        public DateTime BuildDate => new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(BuildEpoch);
+
+        /// <summary>
+        ///     The MaxMind DB database type.
+        /// </summary>
+        public string DatabaseType { get; }
+
+        /// <summary>
+        ///     A map from locale codes to the database description in that language.
+        /// </summary>
+        public IDictionary<string, string> Description { get; }
+
+        /// <summary>
+        ///     The IP version that the database supports. This will be 4 or 6.
+        /// </summary>
+        public int IPVersion { get; }
+
+        /// <summary>
+        ///     A list of locale codes for languages that the database supports.
+        /// </summary>
+        public IReadOnlyList<string> Languages { get; }
+
+        internal long NodeCount { get; }
+
+        internal int RecordSize { get; }
+
+        internal long NodeByteSize => RecordSize / 4;
+
+        internal long SearchTreeSize => NodeCount * NodeByteSize;
+    }
+}
