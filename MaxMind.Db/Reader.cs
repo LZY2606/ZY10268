@@ -42,7 +42,7 @@ namespace MaxMind.Db
     /// <summary>
     ///     Given a MaxMind DB file, this class will retrieve information about an IP address
     /// </summary>
-    public sealed class Reader : IDisposable
+    public sealed partial class Reader : IDisposable
     {
         /// <summary>
         /// A node from the reader iterator
@@ -107,6 +107,11 @@ namespace MaxMind.Db
 
         private bool _disposed;
         private readonly long _ipV4Start;
+
+        // Gates batch operations against Dispose: Dispose blocks until all
+        // in-flight batches release their leases, so a batch view can never
+        // observe a disposed memory map.
+        private readonly ReaderLeaseGate _batchLeaseGate = new();
 
         /// <summary>
         ///     Initializes a new instance of the <see cref="Reader" /> class.
@@ -225,7 +230,11 @@ namespace MaxMind.Db
 
             if (disposing)
             {
+                // Block new batch operations and wait for in-flight batches
+                // to finish before unmapping the database.
+                _batchLeaseGate.CloseAndWait();
                 _database.Dispose();
+                _batchLeaseGate.DisposeHandle();
             }
 
             _disposed = true;
@@ -365,13 +374,40 @@ namespace MaxMind.Db
             return FindAddressInTree(rawAddress, out prefixLength);
         }
 
+#if !NETSTANDARD2_0
+        // Writes the address bytes into scratch and returns the populated
+        // slice. The scratch must be at least 16 bytes so that both address
+        // families fit; batch lookups reuse one scratch per worker.
+        private static ReadOnlySpan<byte> WriteAddressBytes(IPAddress address, Span<byte> scratch)
+        {
+            var length = address.AddressFamily == AddressFamily.InterNetwork ? 4 : 16;
+            var rawAddress = scratch[..length];
+            if (address.TryWriteBytes(rawAddress, out var bytesWritten))
+            {
+                return rawAddress[..bytesWritten];
+            }
+
+            // Defensive fallback matching the single-lookup path.
+            address.GetAddressBytes().CopyTo(rawAddress);
+            return rawAddress;
+        }
+#endif
+
 #if NETSTANDARD2_0
         private long FindAddressInTree(byte[] rawAddress, out int prefixLength)
+        {
+            return FindAddressInTree(rawAddress, rawAddress.Length * 8, out prefixLength);
+        }
+
+        // Overload with an explicit bit length so that batch lookups can pass
+        // a shared 16-byte scratch buffer for both address families.
+        private long FindAddressInTree(byte[] rawAddress, int bitLength, out int prefixLength)
+        {
 #else
         private long FindAddressInTree(ReadOnlySpan<byte> rawAddress, out int prefixLength)
-#endif
         {
             var bitLength = rawAddress.Length * 8;
+#endif
             var record = StartNode(bitLength);
             var nodeCount = _nodeCount;
 

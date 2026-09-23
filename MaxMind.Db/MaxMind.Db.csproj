@@ -70,6 +70,14 @@
                       PrivateAssets="all" />
   </ItemGroup>
 
+  <!-- Span<T> for the synchronous and IAsyncEnumerable<T> for the
+       asynchronous batch lookup API. The types are built in on
+       netstandard2.1 and later targets. -->
+  <ItemGroup Condition=" '$(TargetFramework)' == 'netstandard2.0' ">
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
+    <PackageReference Include="System.Memory" Version="4.5.5" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Include="$(MaxMindDbAnalyzerPackSource)"
           Pack="true"
