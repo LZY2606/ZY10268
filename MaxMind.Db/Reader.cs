@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 
 #endregion
@@ -42,7 +43,7 @@ namespace MaxMind.Db
     /// <summary>
     ///     Given a MaxMind DB file, this class will retrieve information about an IP address
     /// </summary>
-    public sealed class Reader : IDisposable
+    public sealed partial class Reader : IDisposable
     {
         /// <summary>
         /// A node from the reader iterator
@@ -107,6 +108,16 @@ namespace MaxMind.Db
 
         private bool _disposed;
         private readonly long _ipV4Start;
+
+        // Batch lookup lease state. A batch operation holds a lease for its
+        // whole duration so that Dispose can never release the memory-mapped
+        // buffer while a batch projection callback may still read from it.
+        // Dispose sets _batchDisposeRequested, which makes in-flight batches
+        // stop before their next not-yet-started item, and then waits for the
+        // remaining leases to drain before disposing the buffer.
+        private readonly object _batchLeaseGate = new();
+        private int _activeBatchLeases;
+        private volatile bool _batchDisposeRequested;
 
         /// <summary>
         ///     Initializes a new instance of the <see cref="Reader" /> class.
@@ -208,6 +219,16 @@ namespace MaxMind.Db
         /// <summary>
         ///     Release resources back to the system.
         /// </summary>
+        /// <remarks>
+        ///     If a batch lookup (<see cref="LookupBatch{TResult}"/> or
+        ///     <see cref="LookupBatchAsync{TResult}"/>) is in flight on another
+        ///     thread, this method blocks until the batch releases its lease:
+        ///     the batch stops before its next not-yet-started item by throwing
+        ///     <see cref="ObjectDisposedException"/>, and only then is the
+        ///     underlying memory-mapped buffer disposed. Do not call
+        ///     <see cref="Dispose"/> from inside a batch projection callback on
+        ///     the same thread, as that would deadlock.
+        /// </remarks>
         public void Dispose()
         {
             Dispose(true);
@@ -220,16 +241,71 @@ namespace MaxMind.Db
         /// <param name="disposing"></param>
         private void Dispose(bool disposing)
         {
-            if (_disposed)
-                return;
-
-            if (disposing)
+            if (!disposing)
             {
-                _database.Dispose();
+                _disposed = true;
+                return;
             }
 
-            _disposed = true;
+            lock (_batchLeaseGate)
+            {
+                if (_disposed)
+                    return;
+
+                // Signal in-flight batch operations to stop starting new
+                // items, then wait for their leases to drain so that no batch
+                // view can observe a disposed memory map.
+                _batchDisposeRequested = true;
+                while (_activeBatchLeases > 0)
+                {
+                    Monitor.Wait(_batchLeaseGate);
+                }
+                _disposed = true;
+            }
+
+            _database.Dispose();
         }
+
+        // Throws if a batch may not start or continue because the reader is
+        // disposed or is being disposed. Items that have not started yet are
+        // stably cancelled with this exception.
+        private void ThrowIfBatchInvalid()
+        {
+            if (_batchDisposeRequested || _disposed)
+            {
+                throw new ObjectDisposedException(nameof(Reader),
+                    "The reader was disposed while a batch lookup was in progress. "
+                    + "Results already delivered remain valid; items that had not started were cancelled.");
+            }
+        }
+
+        private void AcquireBatchLease()
+        {
+            lock (_batchLeaseGate)
+            {
+                if (_disposed || _batchDisposeRequested)
+                {
+                    throw new ObjectDisposedException(nameof(Reader));
+                }
+                _activeBatchLeases++;
+            }
+        }
+
+        private void ReleaseBatchLease()
+        {
+            lock (_batchLeaseGate)
+            {
+                _activeBatchLeases--;
+                if (_activeBatchLeases == 0)
+                {
+                    Monitor.PulseAll(_batchLeaseGate);
+                }
+            }
+        }
+
+        // Test hook: lets tests deterministically observe that Dispose has
+        // been requested and is waiting for in-flight batch leases to drain.
+        internal bool IsBatchDisposeRequested => _batchDisposeRequested;
 
         /// <summary>
         ///     Finds the data related to the specified address.
@@ -331,7 +407,7 @@ namespace MaxMind.Db
             }
         }
 
-        private T ResolveDataPointer<T>(long pointer, InjectableValues? injectables, Network? network) where T : class
+        internal T ResolveDataPointer<T>(long pointer, InjectableValues? injectables, Network? network) where T : class
         {
             var resolved = pointer + _dataPointerOffset;
 
@@ -345,7 +421,7 @@ namespace MaxMind.Db
             return Decoder.Decode<T>(resolved, out _, injectables, network);
         }
 
-        private long FindAddressInTree(IPAddress address, out int prefixLength)
+        internal long FindAddressInTree(IPAddress address, out int prefixLength)
         {
 #if NETSTANDARD2_0
             byte[] rawAddress;
